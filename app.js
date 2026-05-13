@@ -1,10 +1,19 @@
 // app.js — shared between today-tourcwe and today-forestparkpicnics
 // Expects window.CHECKLIST_CONFIG = { sheetId, tab, title }
+//
+// State sync: ticks are stored in the today-state Cloudflare Worker so all
+// devices viewing the same tab see the same checked items. Polled every 5s.
+// localStorage holds a fallback view of last-known-good state and queues
+// any tick that fails to reach the server.
+
 (() => {
   const cfg = window.CHECKLIST_CONFIG;
   if (!cfg) { document.body.innerHTML = '<p style="padding:1rem">Missing config.</p>'; return; }
 
   const CSV_URL = `https://docs.google.com/spreadsheets/d/${cfg.sheetId}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(cfg.tab)}`;
+  const STATE_URL = 'https://today-state.mike-7a9.workers.dev';
+  const POLL_MS = 5000;
+  const RETRY_MS = 3000;
 
   const todayKey = () => {
     const d = new Date();
@@ -12,13 +21,42 @@
     return `${y}-${m}-${day}`;
   };
 
-  const storeKey = (date, idx) => `${cfg.tab}:${date}:${idx}`;
+  // localStorage layout:
+  //   `${tab}:cache:${date}` → JSON `{idx: true}` cached server state
+  //   `${tab}:queue:${date}` → JSON `{idx: 'put'|'delete'}` pending writes
+  const cacheStoreKey = (date) => `${cfg.tab}:cache:${date}`;
+  const queueStoreKey = (date) => `${cfg.tab}:queue:${date}`;
 
-  // Clear localStorage entries from previous days for this tab
+  // Sweep stale localStorage entries from previous days
   const today = todayKey();
   Object.keys(localStorage)
-    .filter(k => k.startsWith(`${cfg.tab}:`) && !k.startsWith(`${cfg.tab}:${today}:`))
+    .filter(k => k.startsWith(`${cfg.tab}:`) && !k.includes(`:${today}`))
     .forEach(k => localStorage.removeItem(k));
+
+  // In-memory state
+  let checkedState = loadCache();   // {idx: true}
+  let writeQueue = loadQueue();     // {idx: 'put'|'delete'}
+  let items = [];                   // [{section, item, notes}, ...]
+  let pollTimer = null;
+
+  function loadCache() {
+    try { return JSON.parse(localStorage.getItem(cacheStoreKey(today)) || '{}') || {}; }
+    catch { return {}; }
+  }
+  function saveCache() {
+    localStorage.setItem(cacheStoreKey(today), JSON.stringify(checkedState));
+  }
+  function loadQueue() {
+    try { return JSON.parse(localStorage.getItem(queueStoreKey(today)) || '{}') || {}; }
+    catch { return {}; }
+  }
+  function saveQueue() {
+    if (Object.keys(writeQueue).length === 0) {
+      localStorage.removeItem(queueStoreKey(today));
+    } else {
+      localStorage.setItem(queueStoreKey(today), JSON.stringify(writeQueue));
+    }
+  }
 
   // Minimal CSV parser — handles quoted fields with commas/newlines/escaped quotes
   function parseCSV(text) {
@@ -47,9 +85,93 @@
     return d.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
   }
 
-  function render(items) {
+  // ── Server I/O ────────────────────────────────────────────────────────
+  async function fetchServerState() {
+    const r = await fetch(`${STATE_URL}/state/${cfg.tab}`, { cache: 'no-store' });
+    if (!r.ok) throw new Error(`state GET ${r.status}`);
+    const body = await r.json();
+    return body.checked || {};
+  }
+
+  async function writeServerState(idx, checked) {
+    const method = checked ? 'PUT' : 'DELETE';
+    const r = await fetch(`${STATE_URL}/state/${cfg.tab}/${idx}`, { method, cache: 'no-store' });
+    if (!r.ok) throw new Error(`state ${method} ${r.status}`);
+    return r.json();
+  }
+
+  // ── Tick handling ─────────────────────────────────────────────────────
+  async function setItemChecked(idx, checked) {
+    // Optimistic UI
+    if (checked) checkedState[idx] = true; else delete checkedState[idx];
+    saveCache();
+    applyStateToDom();
+
+    // Try to write through
+    try {
+      await writeServerState(idx, checked);
+      // Server confirmed — drop any pending queue entry
+      delete writeQueue[idx];
+      saveQueue();
+      setStatus(`Synced ${new Date().toLocaleTimeString([], {hour:'numeric', minute:'2-digit'})}`);
+    } catch (e) {
+      // Queue for retry; UI keeps optimistic state
+      writeQueue[idx] = checked ? 'put' : 'delete';
+      saveQueue();
+      setStatus('Saving offline — will retry');
+      setTimeout(flushQueue, RETRY_MS);
+    }
+  }
+
+  async function flushQueue() {
+    const entries = Object.entries(writeQueue);
+    if (entries.length === 0) return;
+    for (const [idx, op] of entries) {
+      try {
+        await writeServerState(idx, op === 'put');
+        delete writeQueue[idx];
+      } catch {
+        saveQueue();
+        setTimeout(flushQueue, RETRY_MS);
+        return;
+      }
+    }
+    saveQueue();
+  }
+
+  // ── Polling ───────────────────────────────────────────────────────────
+  async function poll() {
+    try {
+      const server = await fetchServerState();
+      // Don't clobber queued writes — keep local view consistent with what
+      // we've tried to send but haven't yet confirmed
+      for (const [idx, op] of Object.entries(writeQueue)) {
+        if (op === 'put') server[idx] = true;
+        else delete server[idx];
+      }
+      const before = JSON.stringify(checkedState);
+      const after = JSON.stringify(server);
+      if (before !== after) {
+        checkedState = server;
+        saveCache();
+        applyStateToDom();
+      }
+      setStatus(`Synced ${new Date().toLocaleTimeString([], {hour:'numeric', minute:'2-digit'})}`);
+      // Opportunistically retry any failed writes whenever we successfully poll
+      if (Object.keys(writeQueue).length) flushQueue();
+    } catch (e) {
+      setStatus('Offline — using cached state');
+    }
+  }
+
+  function startPolling() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(poll, POLL_MS);
+  }
+
+  // ── Rendering ─────────────────────────────────────────────────────────
+  function render() {
     const main = document.getElementById('main');
-    const date = todayKey();
 
     if (!items.length) {
       main.innerHTML = '<p class="empty">No checklist items found. Add rows to the sheet.</p>';
@@ -57,7 +179,6 @@
       return;
     }
 
-    // Group by section, preserving order of first appearance
     const groups = new Map();
     items.forEach((it, idx) => {
       const sec = it.section || 'Checklist';
@@ -70,7 +191,7 @@
       html.push(`<h2 class="section">${escapeHtml(section)}</h2>`);
       html.push('<ul class="list">');
       for (const row of rows) {
-        const checked = localStorage.getItem(storeKey(date, row.idx)) === '1';
+        const checked = !!checkedState[row.idx];
         html.push(`
           <li class="item ${checked ? 'done' : ''}" data-idx="${row.idx}">
             <label>
@@ -86,22 +207,25 @@
     }
     main.innerHTML = html.join('');
 
-    // Wire checkbox events
     main.querySelectorAll('.item').forEach(li => {
       const idx = li.dataset.idx;
       const cb = li.querySelector('input');
       cb.addEventListener('change', () => {
-        if (cb.checked) {
-          localStorage.setItem(storeKey(date, idx), '1');
-          li.classList.add('done');
-        } else {
-          localStorage.removeItem(storeKey(date, idx));
-          li.classList.remove('done');
-        }
-        updateProgressFromDom();
+        setItemChecked(idx, cb.checked);
       });
     });
 
+    updateProgressFromDom();
+  }
+
+  function applyStateToDom() {
+    document.querySelectorAll('.item').forEach(li => {
+      const idx = li.dataset.idx;
+      const cb = li.querySelector('input');
+      const shouldBeChecked = !!checkedState[idx];
+      if (cb.checked !== shouldBeChecked) cb.checked = shouldBeChecked;
+      li.classList.toggle('done', shouldBeChecked);
+    });
     updateProgressFromDom();
   }
 
@@ -119,15 +243,20 @@
     txt.textContent = total === 0 ? '—' : `${done} of ${total}`;
   }
 
+  function setStatus(text) {
+    const el = document.getElementById('status');
+    if (el) el.textContent = text;
+  }
+
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, c => ({
       '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
     })[c]);
   }
 
-  async function load() {
-    const status = document.getElementById('status');
-    status.textContent = 'Loading…';
+  // ── Initial load ──────────────────────────────────────────────────────
+  async function loadChecklist() {
+    setStatus('Loading…');
     try {
       const res = await fetch(CSV_URL, { cache: 'no-store' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -139,19 +268,36 @@
       const iItem = header.indexOf('item');
       const iNotes = header.indexOf('notes');
       if (iItem === -1) throw new Error('Sheet missing "item" column');
-      const items = rows.slice(1)
+      items = rows.slice(1)
         .map(r => ({
           section: iSec >= 0 ? (r[iSec] || '').trim() : '',
           item: (r[iItem] || '').trim(),
           notes: iNotes >= 0 ? (r[iNotes] || '').trim() : '',
         }))
         .filter(r => r.item);
-      render(items);
-      const t = new Date();
-      status.textContent = `Synced ${t.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'})}`;
+      render();
+
+      // Pull server state, then start polling
+      try {
+        const server = await fetchServerState();
+        for (const [idx, op] of Object.entries(writeQueue)) {
+          if (op === 'put') server[idx] = true; else delete server[idx];
+        }
+        checkedState = server;
+        saveCache();
+        applyStateToDom();
+      } catch {
+        // Use cached state if server unreachable on first load
+        applyStateToDom();
+      }
+
+      if (Object.keys(writeQueue).length) flushQueue();
+      startPolling();
+
+      setStatus(`Synced ${new Date().toLocaleTimeString([], {hour:'numeric', minute:'2-digit'})}`);
     } catch (e) {
       console.error(e);
-      status.textContent = 'Could not load checklist. Pull to refresh.';
+      setStatus('Could not load checklist. Pull to refresh.');
     }
   }
 
@@ -160,6 +306,6 @@
   document.getElementById('date').textContent = formatTodayHeading();
   document.title = cfg.title;
 
-  document.getElementById('refresh').addEventListener('click', load);
-  load();
+  document.getElementById('refresh').addEventListener('click', loadChecklist);
+  loadChecklist();
 })();
