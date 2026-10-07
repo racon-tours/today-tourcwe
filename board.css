@@ -51,9 +51,9 @@ body.locked .progress-row, body.locked #refresh { visibility: hidden; }
 .card-cover {
   display: block;
   width: 100%;
-  aspect-ratio: 4 / 3;
-  object-fit: cover;
-  background: var(--done-bg);
-  border-bottom: 1px solid var(--border);
+  max-width: 380px;
+  height: auto;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  margin: 0 0 0.75rem;
 }
-.item.done .card-cover { opacity: 0.45; }

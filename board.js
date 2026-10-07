@@ -85,16 +85,25 @@
       <h2 class="section">${esc(l.name)}</h2>
       ${l.cards.length ? `<ul class="list">${l.cards.map((c) => `
         <li class="item${checked[c.id] ? " done" : ""}" data-id="${c.id}">
-          ${c.cover ? `<img class="card-cover" loading="lazy" alt="" src="${API}/cover/${cfg.board}/${c.id}?v=${c.cover}&auth=${encodeURIComponent(token())}">` : ""}
           <label>
             <input type="checkbox" ${checked[c.id] ? "checked" : ""}>
             <span class="text"><span class="item-title">${esc(c.name)}</span></span>
           </label>
-          ${c.desc.trim() ? `
+          ${c.desc.trim() || c.cover ? `
             <button class="notes-toggle" aria-expanded="${openNotes.has(c.id)}">${openNotes.has(c.id) ? "Hide notes" : "Notes"}</button>
-            <div class="item-notes card-notes"${openNotes.has(c.id) ? "" : " hidden"}>${md(c.desc)}</div>` : ""}
+            <div class="item-notes card-notes"${openNotes.has(c.id) ? "" : " hidden"}>
+              ${c.cover ? `<img class="card-cover" alt="" data-src="${API}/cover/${cfg.board}/${c.id}?v=${c.cover}&auth=${encodeURIComponent(token())}">` : ""}
+              ${c.desc.trim() ? `<div>${md(c.desc)}</div>` : ""}
+            </div>` : ""}
         </li>`).join("")}</ul>` : '<p class="empty-list">No cards</p>'}`).join("");
+    loadOpenImages();
     progress();
+  }
+
+  function loadOpenImages() {
+    document.querySelectorAll(".card-notes:not([hidden]) img[data-src]").forEach((img) => {
+      img.src = img.dataset.src; img.removeAttribute("data-src");
+    });
   }
 
   function applyChecked() {
@@ -127,6 +136,7 @@
     btn.textContent = open ? "Hide notes" : "Notes";
     btn.setAttribute("aria-expanded", open);
     open ? openNotes.add(id) : openNotes.delete(id);
+    if (open) loadOpenImages();
     save(OPEN_KEY, [...openNotes]);
   });
 
