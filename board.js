@@ -85,6 +85,7 @@
       <h2 class="section">${esc(l.name)}</h2>
       ${l.cards.length ? `<ul class="list">${l.cards.map((c) => `
         <li class="item${checked[c.id] ? " done" : ""}" data-id="${c.id}">
+          ${c.cover ? `<img class="card-cover" loading="lazy" alt="" src="${API}/cover/${cfg.board}/${c.id}?v=${c.cover}&auth=${encodeURIComponent(token())}">` : ""}
           <label>
             <input type="checkbox" ${checked[c.id] ? "checked" : ""}>
             <span class="text"><span class="item-title">${esc(c.name)}</span></span>

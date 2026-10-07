@@ -47,3 +47,13 @@ body.locked .progress-row, body.locked #refresh { visibility: hidden; }
   cursor: pointer;
 }
 .lock-msg { min-height: 1.2em; color: var(--accent-strong); font-size: 0.9rem; margin: 0; }
+
+.card-cover {
+  display: block;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  background: var(--done-bg);
+  border-bottom: 1px solid var(--border);
+}
+.item.done .card-cover { opacity: 0.45; }
